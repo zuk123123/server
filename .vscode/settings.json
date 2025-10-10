@@ -1,0 +1,5 @@
+{
+  "python.defaultInterpreterPath": "/home/jez/Рабочий стол/server/.venv/bin/python",
+  "python.venvPath": "/home/jez/Рабочий стол/server",
+  "python.terminal.activateEnvironment": true
+}
