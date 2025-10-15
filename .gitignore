@@ -1,8 +1,22 @@
-.venv/
+# Generated / local
+*.log
+*.pid
+*.sqlite
+*.db
+*.sqbpro
+
+# Secrets
+*.crt
+*.key
+.env
+
+# Python
 __pycache__/
 *.pyc
-app/db.sqlite
-*.log
-.env
-server.crt
-server.key
+.venv/
+
+# cloudflared artifacts
+server_tunnel/cf_url.txt
+server_tunnel/cf.log
+server_tunnel/cloudflared.pid
+server_tunnel/svc.lock
