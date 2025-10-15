@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+from fastapi import FastAPI, Depends
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from starlette.requests import Request
+from pydantic import BaseModel, Field
+from typing import Optional
+import os, sqlite3, time, hashlib, hmac, base64
+from datetime import datetime, timedelta, timezone
+from passlib.hash import bcrypt
+
+APP_NAME        = os.getenv("POS2_APP_NAME", "AuthServer")
+JWT_SECRET      = os.getenv("POS2_JWT_SECRET", "CHANGE_ME_IN_PROD")
+JWT_EXPIRES_MIN = int(os.getenv("POS2_JWT_EXPIRES_MIN", "60"))
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("POS2_CORS_ORIGINS", "").split(",") if o.strip()]
+TRUSTED_HOSTS   = [h.strip() for h in os.getenv("POS2_TRUSTED_HOSTS", "*").split(",") if h.strip()]
+DB_PATH         = os.getenv("POS2_DB_PATH") or os.path.join(os.path.dirname(__file__), "db.sqlite")
+
+# --- JWT (HS256) ---
+def _b64url(d: bytes) -> str:
+    import base64; return base64.urlsafe_b64encode(d).rstrip(b"=").decode()
+def _b64url_decode(s: str) -> bytes:
+    import base64; pad = "=" * ((4 - len(s) % 4) % 4); return base64.urlsafe_b64decode(s + pad)
+def jwt_encode(payload: dict, secret: str) -> str:
+    import json, hmac, hashlib
+    h = _b64url(json.dumps({"alg":"HS256","typ":"JWT"}, separators=(",",":")).encode())
+    p = _b64url(json.dumps(payload, separators=(",",":")).encode())
+    sig = hmac.new(secret.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest()
+    return f"{h}.{p}.{_b64url(sig)}"
+
+# --- DB helpers (без создания схемы) ---
+def connect_db() -> sqlite3.Connection:
+    # не создаём каталоги/файлы — только открываем
+    conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+def get_db():
+    conn = connect_db()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+# --- Pydantic ---
+class LoginIn(BaseModel):
+    login: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=128)
+
+class RegisterIn(BaseModel):
+    login: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=6, max_length=128)
+    theme: Optional[str] = Field(default="Dark")
+
+class LoginOut(BaseModel):
+    ok: bool
+    themeName: Optional[str] = None
+    token: Optional[str] = None
+    error: Optional[str] = None
+
+class OkOut(BaseModel):
+    ok: bool
+    error: Optional[str] = None
+
+# --- FastAPI ---
+app = FastAPI(title=APP_NAME)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS or ["*"])
+if ALLOWED_ORIGINS:
+    app.add_middleware(CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS, allow_credentials=True,
+        allow_methods=["*"], allow_headers=["*"])
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    t0 = datetime.now()
+    ip = request.client.host if request.client else "unknown"
+    print(f"[{t0:%Y-%m-%d %H:%M:%S}] {ip} {request.method} {request.url.path}")
+    try:
+        resp = await call_next(request)
+        return resp
+    except Exception as e:
+        # глобальный JSON-ответ на неперехваченные ошибки
+        return JSONResponse(status_code=500, content={"ok": False, "error": f"internal:{type(e).__name__}"})
+    finally:
+        t1 = datetime.now()
+        print(f"[{t1:%Y-%m-%d %H:%M:%S}] done {request.method} {request.url.path} ({int((t1-t0).total_seconds()*1000)} ms)")
+
+@app.on_event("startup")
+def on_startup():
+    print(f"[Srv] Using DB: {DB_PATH}")
+    # нарочно НЕ создаём схему — если её нет, эндпоинты вернут понятную ошибку
+
+@app.get("/ping", response_model=OkOut)
+def ping():
+    return {"ok": True}
+
+@app.post("/api/register", response_model=OkOut)
+def register(payload: RegisterIn, conn: sqlite3.Connection = Depends(get_db)):
+    try:
+        login = payload.login.strip()
+        theme = (payload.theme or "Dark").strip()
+        if theme not in ("Light", "Dark"): theme = "Dark"
+        cur = conn.cursor()
+        cur.execute("INSERT INTO users(login, password_hash) VALUES(?,?)",
+                    (login, bcrypt.hash(payload.password)))
+        uid = cur.lastrowid
+        cur.execute("INSERT INTO settings(user_id, theme) VALUES(?,?)", (uid, theme))
+        return {"ok": True}
+    except sqlite3.OperationalError as e:
+        # типичные причины: нет таблиц users/settings
+        return {"ok": False, "error": f"schema_error:{e}"}
+    except sqlite3.IntegrityError:
+        return {"ok": False, "error": "user_exists"}
+
+@app.post("/api/login", response_model=LoginOut)
+def login(payload: LoginIn, conn: sqlite3.Connection = Depends(get_db)):
+    try:
+        user = payload.login.strip()
+        cur = conn.cursor()
+        cur.execute("SELECT id, password_hash FROM users WHERE login=?", (user,))
+        row = cur.fetchone()
+        if not row:
+            return {"ok": False, "error": "not_found"}
+        if not bcrypt.verify(payload.password, row["password_hash"]):
+            return {"ok": False, "error": "bad_credentials"}
+        uid = row["id"]
+        cur.execute("SELECT theme FROM settings WHERE user_id=?", (uid,))
+        srow = cur.fetchone()
+        theme = srow["theme"] if srow else "Dark"
+        exp = datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRES_MIN)
+        token = jwt_encode({"sub": str(uid), "login": user, "exp": exp.timestamp()}, JWT_SECRET)
+        return {"ok": True, "themeName": theme, "token": token}
+    except sqlite3.OperationalError as e:
+        return {"ok": False, "error": f"schema_error:{e}"}
